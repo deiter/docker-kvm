@@ -69,15 +69,29 @@ fi
 
 echo "[disk image]"
 if [ "$IMAGE_CREATE" == "1" ]; then
+  if [ -e "${IMAGE}" ]; then
+    echo "${IMAGE} already exist"
+    exit 1
+  fi
   qemu-img create -f ${IMAGE_FORMAT} ${IMAGE} ${IMAGE_SIZE}
-elif [ "${IMAGE:0:4}" != "rbd:" ] && [ ! -f "$IMAGE" ]; then
+elif [ "${IMAGE:0:4}" != "rbd:" ] && [ ! -e "$IMAGE" ]; then
   echo "IMAGE not found: ${IMAGE}"; exit 1;
 fi
+
 if [ "$DISK_DEVICE" == "scsi" ]; then
-  FLAGS_DISK_IMAGE="-device virtio-scsi-pci,id=scsi -drive file=${IMAGE},if=none,id=hd,cache=${IMAGE_CACHE},discard=${IMAGE_DISCARD},index=1 -device scsi-hd,drive=hd"
+  FLAGS_DISK_IMAGE="-device virtio-scsi-pci,id=scsi -device scsi-hd,drive=hd -drive file=${IMAGE},if=none,id=hd,cache=${IMAGE_CACHE},format=${IMAGE_FORMAT},discard=${IMAGE_DISCARD}"
 else
   FLAGS_DISK_IMAGE="-drive file=${IMAGE},if=${DISK_DEVICE},cache=${IMAGE_CACHE},format=${IMAGE_FORMAT},index=1"
 fi
+
+if [ -n "$DISKS" ]; then
+  INDEX=1
+  for DISK in $DISKS; do
+    (( INDEX++ ))
+      FLAGS_DISK_IMAGE="$FLAGS_DISK_IMAGE -device vfio-pci,host=$DISK"
+  done
+fi
+
 echo "parameter: ${FLAGS_DISK_IMAGE}"
 
 if [ -n "$FLOPPY" ]; then
@@ -89,10 +103,12 @@ fi
 echo "[network]"
 if [ "$NETWORK" == "bridge" ]; then
   NETWORK_BRIDGE="${NETWORK_BRIDGE:-docker0}"
-  hexchars="0123456789ABCDEF"
-  NETWORK_MAC="${NETWORK_MAC:-$(echo 00:F0$(for i in {1..8} ; do echo -n ${hexchars:$(( $RANDOM % 16 )):1} ; done | sed -e 's/\(..\)/:\1/g'))}"
+  if [ -z "$NETWORK_MAC" ]; then
+    NETWORK_MAC=$(od -An -N6 -tx1 /dev/urandom | sed -e 's/^  *//' -e 's/  */:/g' -e 's/:$//' -e 's/^\(.\)[13579bdf]/\10/')
+  fi
+  mkdir -p /etc/qemu
   echo allow $NETWORK_BRIDGE > /etc/qemu/bridge.conf
-  FLAGS_NETWORK="-netdev bridge,br=${NETWORK_BRIDGE},id=net0 -device virtio-net,netdev=net0,mac=${NETWORK_MAC}"
+  FLAGS_NETWORK="-netdev bridge,br=${NETWORK_BRIDGE},id=net0 -device virtio-net-pci,netdev=net0,mac=${NETWORK_MAC},host_mtu=9000"
 elif [ "$NETWORK" == "tap" ]; then
   IFACE=eth0
   TAP_IFACE=tap0
@@ -121,31 +137,44 @@ elif [ "$NETWORK" == "tap" ]; then
   FLAGS_NETWORK="-netdev tap,id=net0,ifname=tap0,vhost=on,script=no,downscript=no -device virtio-net-pci,netdev=net0"
 elif [ "$NETWORK" == "macvtap" ]; then
   NETWORK_IF="${NETWORK_IF:-eth0}"
-  NETWORK_BRIDGE="${NETWORK_BRIDGE:-vtap0}"
-  hexchars="0123456789ABCDEF"
-  NETWORK_MAC="${NETWORK_MAC:-$(echo 00:F0$(for i in {1..8} ; do echo -n ${hexchars:$(( $RANDOM % 16 )):1} ; done | sed -e 's/\(..\)/:\1/g'))}"
-  set +e
-  ip link add link $NETWORK_IF name $NETWORK_BRIDGE address $NETWORK_MAC type macvtap mode bridge
-  if [[ $? -ne 0 ]]; then
-    echo "Warning! Bridge interface already exists"
+  NETWORK_FDS=${NETWORK_FDS:-4}
+  NETWORK_MTU=${NETWORK_MTU:-9000}
+  NETWORK_QUEUE=${NETWORK_QUEUE:-1024}
+  NETWORK_BRIDGE="${NETWORK_BRIDGE:-macvtap0}"
+  NETWORK_MAC=$(cat /sys/class/net/$NETWORK_BRIDGE/address)
+  NETWORK_INDEX=$(cat /sys/class/net/$NETWORK_BRIDGE/ifindex)
+  if (( NETWORK_FDS > 10 )); then
+    NETWORK_FDS=10
   fi
-  set -e
-  FLAGS_NETWORK="-netdev tap,fd=3,id=net0,vhost=on -net nic,vlan=0,netdev=net0,macaddr=$NETWORK_MAC,model=virtio"
-  exec 3<> /dev/tap`cat /sys/class/net/$NETWORK_BRIDGE/ifindex`
-  ip link set $NETWORK_BRIDGE up
-  if [ ! -z "$NETWORK_IF2" ]; then
-    NETWORK_BRIDGE2="${NETWORK_BRIDGE2:-vtap1}"
-    NETWORK_MAC2="${NETWORK_MAC2:-$(echo 00:F0$(for i in {1..8} ; do echo -n ${hexchars:$(( $RANDOM % 16 )):1} ; done | sed -e 's/\(..\)/:\1/g'))}"
-    set +e
-    ip link add link $NETWORK_IF2 name $NETWORK_BRIDGE2 address $NETWORK_MAC2 type macvtap mode bridge
-    if [[ $? -ne 0 ]]; then
-      echo "Warning! Bridge interface 2 already exists"
-    fi
-    set -e
-    FLAGS_NETWORK="${FLAGS_NETWORK} -netdev tap,fd=4,id=net1,vhost=on -net nic,vlan=1,netdev=net1,macaddr=$NETWORK_MAC2,model=virtio"
-    exec 4<> /dev/tap`cat /sys/class/net/$NETWORK_BRIDGE2/ifindex`
-    ip link set $NETWORK_BRIDGE2 up
+  NETWORK_VECTORS=$(( 2 * NETWORK_FDS + 2 ))
+  NETWORK_FD=10
+  FD=$NETWORK_FD
+  FDS=""
+  while (( FD < NETWORK_FD + NETWORK_FDS )); do
+	  eval "exec $FD<>/dev/tap$NETWORK_INDEX"
+    FDS="${FDS:+$FDS:}${FD}"
+    (( FD++ ))
+  done
+  FLAGS_NETWORK="-netdev tap,vhost=on,fds=$FDS,id=net0 -device virtio-net-pci,netdev=net0,mac=$NETWORK_MAC,mq=on,vectors=$NETWORK_VECTORS,host_mtu=$NETWORK_MTU,rx_queue_size=$NETWORK_QUEUE,tx_queue_size=$NETWORK_QUEUE"
+  if [[ ! -z "$NETWORK_IF2" ]]; then
+    NETWORK_BRIDGE2="${NETWORK_BRIDGE2:-macvtap1}"
+    NETWORK_MAC2=$(cat /sys/class/net/$NETWORK_BRIDGE2/address)
+    NETWORK_INDEX=$(cat /sys/class/net/$NETWORK_BRIDGE2/ifindex)
+    NETWORK_FD=20
+    FD=$NETWORK_FD
+    FDS=""
+    while (( FD < NETWORK_FD + NETWORK_FDS )); do
+      eval "exec $FD<>/dev/tap$NETWORK_INDEX"
+      FDS="${FDS:+$FDS:}${FD}"
+      (( FD++ ))
+    done
+    FLAGS_NETWORK="$FLAGS_NETWORK -netdev tap,vhost=on,fds=$FDS,id=net1 -device virtio-net-pci,netdev=net1,mac=$NETWORK_MAC2,mq=on,vectors=$NETWORK_VECTORS,host_mtu=$NETWORK_MTU,rx_queue_size=$NETWORK_QUEUE,tx_queue_size=$NETWORK_QUEUE"
   fi
+elif [ "$NETWORK" == "none" ]; then
+	NETWORK_BRIDGE="${NETWORK_BRIDGE:-docker0}"
+	mkdir -p /etc/qemu
+	echo allow $NETWORK_BRIDGE > /etc/qemu/bridge.conf
+	FLAGS_NETWORK="-netdev bridge,br=${NETWORK_BRIDGE},id=net0 -device vmxnet3,netdev=net0"
 else
   NETWORK="user"
   REDIR=""
@@ -196,8 +225,9 @@ if [ -n "$KEYBOARD" ]; then
 fi
 
 set -x
-exec /usr/bin/kvm ${FLAGS_REMOTE_ACCESS} \
-  -k en-us -m ${RAM} -smp ${SMP} -cpu ${FLAGS_CPU} -usb -usbdevice tablet -no-shutdown \
+/usr/bin/qemu-system-x86_64 -enable-kvm  ${FLAGS_REMOTE_ACCESS} \
+ -uuid ${UUID} \
+  -k en-us -m ${RAM} -smp ${SMP} -cpu ${FLAGS_CPU} -no-shutdown \
   -name ${HOSTNAME} \
   ${FLAGS_DISK_IMAGE} \
   ${FLAGS_FLOPPY_IMAGE} \
